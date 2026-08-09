@@ -39,6 +39,20 @@ from gnocchi import utils
 LOG = daiquiri.getLogger(__name__)
 
 
+def prepare_service():
+    conf = cfg.ConfigOpts()
+    conf.register_cli_opts([
+        cfg.IntOpt("stop-after-processing-metrics",
+                   default=0,
+                   min=0,
+                   help="Number of metrics to process without workers, "
+                   "for testing purpose"),
+    ])
+    for group, options in oslo_config_glue.list_opts():
+        conf.register_opts(options, group=group)
+    return service.prepare_service(conf=conf)
+
+
 @utils.retry_on_exception_and_log("Unable to initialize coordination driver")
 def get_coordinator_and_start(member_id, url):
     coord = coordination.get_coordinator(url, member_id)
@@ -47,9 +61,9 @@ def get_coordinator_and_start(member_id, url):
 
 
 class MetricProcessBase(cotyledon.Service):
-    def __init__(self, worker_id, conf, interval_delay=0):
+    def __init__(self, worker_id, interval_delay=0):
         super(MetricProcessBase, self).__init__(worker_id)
-        self.conf = conf
+        self.conf = prepare_service()
         self.startup_delay = self.worker_id = worker_id
         self.interval_delay = interval_delay
         self._wake_up = threading.Event()
@@ -111,9 +125,9 @@ class MetricProcessBase(cotyledon.Service):
 class MetricReporting(MetricProcessBase):
     name = "reporting"
 
-    def __init__(self, worker_id, conf):
-        super(MetricReporting, self).__init__(
-            worker_id, conf, conf.metricd.metric_reporting_delay)
+    def __init__(self, worker_id):
+        super(MetricReporting, self).__init__(worker_id)
+        self.interval_delay = self.conf.metricd.metric_reporting_delay
 
     def _configure(self):
         self.incoming = incoming.get_driver(self.conf)
@@ -138,9 +152,8 @@ class MetricProcessor(MetricProcessBase):
     name = "processing"
     GROUP_ID = b"gnocchi-processing"
 
-    def __init__(self, worker_id, conf):
-        super(MetricProcessor, self).__init__(
-            worker_id, conf, conf.metricd.metric_processing_delay)
+    def __init__(self, worker_id):
+        super(MetricProcessor, self).__init__(worker_id)
         self._tasks = []
         self.group_state = None
         self.sacks_with_measures_to_process = set()
@@ -150,8 +163,9 @@ class MetricProcessor(MetricProcessBase):
         # Only update the list of sacks to process every
         # metric_processing_delay
         self._get_sacks_to_process = cachetools.func.ttl_cache(
-            ttl=conf.metricd.metric_processing_delay
+            ttl=self.conf.metricd.metric_processing_delay
         )(self._get_sacks_to_process)
+        self.interval_delay = self.conf.metricd.metric_processing_delay
 
     @tenacity.retry(
         wait=utils.wait_exponential,
@@ -262,9 +276,9 @@ class MetricProcessor(MetricProcessBase):
 class MetricJanitor(MetricProcessBase):
     name = "janitor"
 
-    def __init__(self, worker_id, conf):
-        super(MetricJanitor, self).__init__(
-            worker_id, conf, conf.metricd.metric_cleanup_delay)
+    def __init__(self, worker_id):
+        super(MetricJanitor, self).__init__(worker_id)
+        self.interval_delay = self.conf.metricd.metric_cleanup_delay
 
     def _run_job(self):
         LOG.debug("Cleaning up deleted metrics with batch size [%s].",
@@ -301,16 +315,15 @@ class MetricJanitor(MetricProcessBase):
 
 class MetricdServiceManager(cotyledon.ServiceManager):
     def __init__(self, conf):
-        super(MetricdServiceManager, self).__init__()
-        oslo_config_glue.setup(self, conf)
+        super(MetricdServiceManager, self).__init__(
+            graceful_shutdown_timeout=conf.graceful_shutdown_timeout)
 
         self.conf = conf
         self.metric_processor_id = self.add(
-            MetricProcessor, args=(self.conf,),
-            workers=conf.metricd.workers)
+            MetricProcessor, workers=conf.metricd.workers)
         if self.conf.metricd.metric_reporting_delay >= 0:
-            self.add(MetricReporting, args=(self.conf,))
-        self.add(MetricJanitor, args=(self.conf,))
+            self.add(MetricReporting)
+        self.add(MetricJanitor)
 
         self.register_hooks(on_reload=self.on_reload)
 
@@ -320,6 +333,8 @@ class MetricdServiceManager(cotyledon.ServiceManager):
         # restarted with the new number of workers. This is important because
         # we use the number of worker to declare the capability in tooz and
         # to select the block of metrics to proceed.
+        self.conf.reload_config_files()
+        self._graceful_shutdown_timeout = self.conf.graceful_shutdown_timeout
         self.reconfigure(self.metric_processor_id,
                          workers=self.conf.metricd.workers)
 
@@ -343,15 +358,7 @@ def metricd_tester(conf):
 
 
 def metricd():
-    conf = cfg.ConfigOpts()
-    conf.register_cli_opts([
-        cfg.IntOpt("stop-after-processing-metrics",
-                   default=0,
-                   min=0,
-                   help="Number of metrics to process without workers, "
-                   "for testing purpose"),
-    ])
-    conf = service.prepare_service(conf=conf)
+    conf = prepare_service()
 
     if conf.stop_after_processing_metrics:
         metricd_tester(conf)
