@@ -13,6 +13,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import multiprocessing
 import socket
 import threading
 import time
@@ -343,6 +344,10 @@ def metricd_tester(conf):
 
 
 def metricd():
+    # Python 3.14 changed the POSIX default start method to 'forkserver'.
+    # Gnocchi passes non-picklable oslo.config objects to Cotyledon workers.
+    multiprocessing.set_start_method('fork', force=True)
+
     conf = cfg.ConfigOpts()
     conf.register_cli_opts([
         cfg.IntOpt("stop-after-processing-metrics",

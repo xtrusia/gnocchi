@@ -15,11 +15,27 @@
 # under the License.
 import os
 import subprocess
+from unittest import mock
 
+from gnocchi.cli import metricd
 from gnocchi.tests import base
 
 
 class BinTestCase(base.BaseTestCase):
+    @mock.patch('multiprocessing.set_start_method')
+    @mock.patch.object(metricd, 'MetricdServiceManager')
+    @mock.patch.object(metricd.service, 'prepare_service')
+    def test_gnocchi_metricd_uses_fork(self, prepare_service,
+                                       service_manager, set_start_method):
+        conf = mock.Mock(stop_after_processing_metrics=0)
+        prepare_service.return_value = conf
+
+        metricd.metricd()
+
+        set_start_method.assert_called_once_with('fork', force=True)
+        service_manager.assert_called_once_with(conf)
+        service_manager.return_value.run.assert_called_once_with()
+
     def test_gnocchi_config_generator_run(self):
         with open(os.devnull, 'w') as f:
             subp = subprocess.Popen(['gnocchi-config-generator'], stdout=f)
